@@ -20,8 +20,12 @@ After the first flash, HA finds the board on its own: **Settings → Devices
 | `switch.car_battery_battery_guard_connection` | off = stop polling altogether |
 | diagnostics | RSSI, WiFi signal, voltage rise/drop event counters |
 
-Entity IDs come from the friendly name, so check them in the device page
-if you renamed anything.
+Entity IDs come from the device's friendly name. If the device is in an
+area, Home Assistant also puts the area in front of entities created after
+that, e.g. `binary_sensor.garage_car_battery_car_in_range`. So IDs can
+differ from this table, even between entities of the same device. If a
+card or automation says "Entity not found", look up the real IDs on the
+**Car Battery** device page.
 
 ## Automations and dashboard
 

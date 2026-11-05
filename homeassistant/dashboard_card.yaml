@@ -1,4 +1,8 @@
 # Dashboard > Edit > Add card > Manual, paste this.
+# Entity IDs depend on your setup: if the device is in an area, entities
+# created after that get the area as a prefix (e.g.
+# binary_sensor.garage_car_battery_car_in_range). On "Entity not found",
+# look up the real IDs on the Car Battery device page.
 type: vertical-stack
 cards:
   - type: entities
