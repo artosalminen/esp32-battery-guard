@@ -16,6 +16,35 @@ so you can check the car battery at a glance in the garage.
   disconnects in between, so the phone app still works between readings.
 - Low-battery notification automation and a dashboard card are included.
 
+## What it looks like
+
+| Home Assistant | The board | intAct phone app |
+|:---:|:---:|:---:|
+| <img src="docs/images/home-assistant-card.png" width="230" alt="Home Assistant card showing 12.73 V, 92 %, state good, not charging, 8 °C, car in range: Home, and a Read now button above a 7-day voltage graph"> | <img src="docs/images/device-details-screen.png" width="230" alt="ESP32-C3 board in a 3D-printed case, OLED showing the details screen: 7 °C, BT-88, rise 0, drop 0, WiFi -78dB"> | <img src="docs/images/intact-app.png" width="230" alt="intAct Battery Guard app showing SoC 92 %, Battery OK, 12.71 V and 8 °C"> |
+
+The same battery seen three ways, on the same afternoon:
+
+- **Home Assistant** (left) gets a reading every 15 minutes: voltage,
+  charge, a resting-voltage rating (`good` / `ok` / `low` / `critical` /
+  `charging`), the charging flag and temperature. `Car in range` turns
+  *Home* when the last cycle reached the Battery Guard, and `Read now`
+  takes a reading on demand. The card is
+  [`homeassistant/dashboard_card.yaml`](homeassistant/dashboard_card.yaml).
+  The graph builds up a voltage history over the week. It's one line here
+  because the setup had just been installed.
+- **The board** (middle), here in a 3D-printed case, normally shows SOC,
+  the voltage in large digits, an SOC bar and how many minutes old the
+  reading is. A long press on the BOOT button brings up the details screen
+  in the photo: temperature, Bluetooth signal to the Battery Guard
+  (`BT-88` dBm, workable through the car body and a garage wall), the
+  Battery Guard's voltage rise/drop event counters, and WiFi signal. A
+  short press takes a reading now.
+- **The intAct app** (right) keeps working. The board holds the Bluetooth
+  link for only about 3 seconds per cycle, so the phone can connect in
+  between. Its 92 %, about 12.7 V and 8 °C match what Home Assistant
+  shows. The small voltage difference comes from readings taken a few
+  minutes apart.
+
 The BLE protocol handling is adapted from
 [Waldmensch1/BatteryGuard](https://github.com/Waldmensch1/BatteryGuard)
 (MIT, PlatformIO + NimBLE + MQTT). This project ports it to ESPHome.
@@ -94,6 +123,7 @@ has the setup steps.
 | `docs/flashing.md` | Building and flashing, first-run checks, troubleshooting |
 | `docs/home-assistant.md` | Entities, automation, dashboard, Bluetooth-proxy alternative |
 | `docs/protocol.md` | BLE protocol reference |
+| `docs/images/` | Screenshots used in this README |
 | `homeassistant/` | Low-battery automation and dashboard card, ready to paste |
 
 ## Status
