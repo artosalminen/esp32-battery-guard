@@ -1,0 +1,11 @@
+# Real secrets — copy secrets.yaml.example to secrets.yaml and fill it in,
+# but never commit the real file
+esphome/secrets.yaml
+
+# ESPHome build cache/artifacts
+.esphome/
+*.bin
+
+# OS junk
+.DS_Store
+Thumbs.db

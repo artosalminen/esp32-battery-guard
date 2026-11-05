@@ -1,0 +1,25 @@
+# Dashboard > Edit > Add card > Manual, paste this.
+type: vertical-stack
+cards:
+  - type: entities
+    title: Car battery
+    state_color: true
+    entities:
+      - entity: sensor.car_battery_voltage
+        name: Voltage
+      - entity: sensor.car_battery_state_of_charge
+        name: Charge
+      - entity: sensor.car_battery_battery_state
+        name: State
+      - entity: binary_sensor.car_battery_charging
+        name: Charging
+      - entity: sensor.car_battery_temperature
+        name: Temperature
+      - entity: binary_sensor.car_battery_car_in_range
+        name: Car in range
+      - entity: button.car_battery_read_now
+        name: Read now
+  - type: history-graph
+    hours_to_show: 168
+    entities:
+      - entity: sensor.car_battery_voltage

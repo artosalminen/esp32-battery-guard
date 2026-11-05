@@ -1,0 +1,489 @@
+# ============================================================================
+# Car battery monitor: intAct Battery Guard (BM6) -> ESP32-C3 (0.42" OLED)
+# -> Home Assistant
+# ============================================================================
+#
+# Adapted from https://github.com/Waldmensch1/BatteryGuard (PlatformIO /
+# NimBLE / MQTT) to ESPHome, so it talks to Home Assistant over the native
+# API and is managed and OTA-updated like your other ESPHome nodes.
+#
+# HARDWARE:
+#   - AYWHP / diymore-style ESP32-C3 dev board with a built-in 0.42" 72x40
+#     SSD1306 OLED (I2C SDA=GPIO5 / SCL=GPIO6, address 0x3C). No wiring:
+#     the board only needs USB-C power, placed within BLE range of the car.
+#   - intAct Battery Guard (BM6 clone) clamped to the car battery. Its MAC
+#     is the serial printed on the device, e.g. A1B2C3D4E5F6 -> A1:B2:C3:D4:E5:F6.
+#     Put it in secrets.yaml as bm6_mac.
+#
+# HOW IT WORKS (poll mode, to keep the Battery Guard's radio mostly idle):
+#   1. Every 15 min (first one right at boot, plus the "Read Now" button) the
+#      read_cycle script connects to the Battery Guard.
+#   2. On connect we send BatteryGuard's 6-write AES handshake to FFF3. The
+#      device then notifies FFF4 about once a second.
+#   3. Each notification is decrypted in bm6.h and parsed into globals. As
+#      soon as one valid reading is in (or after 60s), the script
+#      disconnects again. A cycle takes roughly 10-15s.
+#   4. If no reading arrived for 2 cycles (car gone, out of range), the
+#      sensors go "unknown" rather than showing a stale voltage.
+#
+# NOTE: the Battery Guard accepts ONE BLE connection. Between cycles it's
+#   free, so the intAct phone app can connect. The "Battery Guard
+#   Connection" switch in Home Assistant stops polling altogether.
+#
+# ON-BOARD DISPLAY:
+#   Top row:    SOC %  ...........  minutes since the reading
+#   Middle:     voltage, big (inverted while charging / engine running)
+#   Bottom:     SOC bar
+#   With no data: "no car" plus WiFi / HA connection dots.
+#
+# BOOT BUTTON (GPIO9):
+#   Short press:          take a reading now (same as "Read Now" in HA)
+#   Long press (>= 1s):   details for 5s: temperature, BLE RSSI, rise/drop
+#                         event counters, WiFi RSSI
+# ============================================================================
+
+substitutions:
+  # 1 = lead acid, 2 = AGM, 5 = lithium (as set in the intAct app)
+  battery_type: "1"
+  # How often to connect and take a reading
+  poll_interval: 15min
+  # Sensors report "unknown" once the last reading is older than this
+  # (2 missed cycles + slack = 35 min)
+  stale_ms: "2100000"
+
+esphome:
+  name: battery-guard
+  friendly_name: Car Battery
+  includes:
+    - bm6.h
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # BLE at max TX power (+20 dBm, ESP-IDF default is +9) to reach the
+      # Battery Guard through the car body
+      CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P20: y
+
+wifi:
+  id: wifi_conn
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Full TX power. Some units of this board design have a poorly matched
+  # antenna and fail to associate ("Auth Expired") at full power; if yours
+  # never joins WiFi, lower this, e.g. to 8.5dB.
+  output_power: 20.5dB
+  fast_connect: true
+  # power_save_mode stays at its default (light): WiFi/BLE coexistence on
+  # the single-radio C3 needs modem sleep.
+
+api:
+  id: api_server
+  encryption:
+    key: !secret battery_guard_api_key
+
+ota:
+  platform: esphome
+  password: !secret battery_guard_ota_password
+
+logger:
+
+globals:
+  - id: bm_voltage
+    type: float
+    initial_value: "NAN"
+  - id: bm_temp
+    type: int
+    initial_value: "0"
+  - id: bm_soc
+    type: int
+    initial_value: "0"
+  - id: bm_status
+    type: int
+    initial_value: "0"
+  - id: bm_vrise
+    type: int
+    initial_value: "0"
+  - id: bm_vdrop
+    type: int
+    initial_value: "0"
+  # millis() of the last valid reading; 0 = none since boot
+  - id: bm_last_ms
+    type: uint32_t
+    initial_value: "0"
+  # Notifications since connect. BatteryGuard found the first 5 after the
+  # handshake carry garbage (e.g. 61 °C), so they're dropped.
+  - id: bm_notify_count
+    type: int
+    initial_value: "0"
+  # millis() when the current read cycle started
+  - id: cycle_start_ms
+    type: uint32_t
+    initial_value: "0"
+  # Whether the last read cycle got a reading
+  - id: last_cycle_ok
+    type: bool
+    initial_value: "false"
+  # millis() of the last long press, for the details screen
+  - id: details_ms
+    type: uint32_t
+    initial_value: "0"
+
+esp32_ble_tracker:
+
+script:
+  # One poll: connect, wait for a valid reading, disconnect.
+  - id: read_cycle
+    mode: single
+    then:
+      - lambda: id(cycle_start_ms) = millis();
+      - ble_client.connect: bm6_client
+      - wait_until:
+          condition:
+            lambda: return id(bm_last_ms) != 0 && id(bm_last_ms) - id(cycle_start_ms) < 0x80000000u;
+          timeout: 60s
+      - lambda: |-
+          id(last_cycle_ok) = id(bm_last_ms) != 0 && id(bm_last_ms) - id(cycle_start_ms) < 0x80000000u;
+          if (!id(last_cycle_ok))
+            ESP_LOGW("bm6", "No reading this cycle (car away or out of range?)");
+      - if:
+          condition:
+            lambda: return id(bm6_client).connected();
+          then:
+            - component.update: bm6_rssi
+            - delay: 500ms
+      - ble_client.disconnect: bm6_client
+      # Push the new values right away rather than waiting for the next update
+      - component.update: voltage
+      - component.update: soc
+      - component.update: temperature
+      - component.update: battery_state
+      - component.update: oled
+
+interval:
+  - interval: ${poll_interval}
+    then:
+      - script.execute: read_cycle
+
+button:
+  - platform: template
+    name: "Read Now"
+    icon: mdi:refresh
+    on_press:
+      - script.execute: read_cycle
+
+ble_client:
+  # Your Battery Guard's MAC, from secrets.yaml
+  - mac_address: !secret bm6_mac
+    id: bm6_client
+    # Only connect when read_cycle asks
+    auto_connect: false
+    on_connect:
+      - lambda: |-
+          id(bm_notify_count) = 0;
+          ESP_LOGI("bm6", "Connected, sending handshake");
+      # Let notification subscription settle before the handshake
+      - delay: 1s
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(0, ${battery_type});
+      - delay: 50ms
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(1, ${battery_type});
+      - delay: 50ms
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(2, ${battery_type});
+      - delay: 50ms
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(3, ${battery_type});
+      - delay: 50ms
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(4, ${battery_type});
+      - delay: 50ms
+      - ble_client.ble_write:
+          id: bm6_client
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF3"
+          value: !lambda return bm6::handshake(5, ${battery_type});
+    on_disconnect:
+      - logger.log: "Battery Guard disconnected"
+
+i2c:
+  id: bus_a
+  sda: GPIO5
+  scl: GPIO6
+  frequency: 400kHz
+
+sensor:
+  # Raw FFF4 notifications. Decrypts and parses each one into the globals;
+  # internal, because it fires once a second.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: bm6_client
+    id: bm6_raw
+    internal: true
+    service_uuid: "FFF0"
+    characteristic_uuid: "FFF4"
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (++id(bm_notify_count) <= 5) return NAN;
+      bm6::Reading r;
+      // Handshake acks also arrive here; only a steady stream of these
+      // (no readings at all) points at a wrong key
+      if (!bm6::parse(x, r)) {
+        ESP_LOGD("bm6", "Skipping non-data notification");
+        return NAN;
+      }
+      // The first data frame after the handshake is all zeros
+      if (r.voltage < 1.0f) {
+        ESP_LOGD("bm6", "Skipping empty data frame");
+        return NAN;
+      }
+      id(bm_voltage) = r.voltage;
+      id(bm_temp) = r.temperature;
+      id(bm_soc) = r.soc;
+      id(bm_status) = r.status;
+      id(bm_vrise) = r.vrise;
+      id(bm_vdrop) = r.vdrop;
+      id(bm_last_ms) = millis();
+      ESP_LOGD("bm6", "%.2f V | %d %% | %d °C | status %d | rise %d | drop %d",
+               r.voltage, r.soc, r.temperature, r.status, r.vrise, r.vdrop);
+      return r.voltage;
+
+  - platform: template
+    name: "Voltage"
+    id: voltage
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh ? id(bm_voltage) : NAN;
+
+  - platform: template
+    name: "State of Charge"
+    id: soc
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh ? (float) id(bm_soc) : NAN;
+
+  - platform: template
+    name: "Temperature"
+    id: temperature
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh ? (float) id(bm_temp) : NAN;
+
+  # Event counters kept by the Battery Guard itself. Rise = alternator
+  # kicking in (engine start), drop = cranking / heavy loads.
+  - platform: template
+    name: "Voltage Rise Events"
+    entity_category: diagnostic
+    icon: mdi:trending-up
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 300s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh ? (float) id(bm_vrise) : NAN;
+
+  - platform: template
+    name: "Voltage Drop Events"
+    entity_category: diagnostic
+    icon: mdi:trending-down
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 300s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh ? (float) id(bm_vdrop) : NAN;
+
+  # Signal strength to the Battery Guard, for finding a good spot for the board
+  - platform: ble_client
+    type: rssi
+    ble_client_id: bm6_client
+    name: "Battery Guard RSSI"
+    id: bm6_rssi
+    entity_category: diagnostic
+    # Only valid while connected; read_cycle polls it before disconnecting
+    update_interval: never
+    filters:
+      # The component publishes NaN on every disconnect; keep the last value
+      - filter_out: nan
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 120s
+
+binary_sensor:
+  - platform: template
+    name: "Charging"
+    id: charging
+    device_class: battery_charging
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      return fresh && id(bm_status) == 2;
+
+  # On if the last read cycle got a reading: in practice "car is at home"
+  - platform: template
+    name: "Car In Range"
+    id: car_in_range
+    device_class: presence
+    lambda: return id(last_cycle_ok);
+
+  # The board's BOOT button. Only read after boot, so its strapping role
+  # doesn't matter here. Active low, has an external pull-up on the board.
+  - platform: gpio
+    id: boot_button
+    internal: true
+    pin:
+      number: GPIO9
+      inverted: true
+      ignore_strapping_warning: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 20ms
+    on_multi_click:
+      # Long press: details screen
+      - timing:
+          - ON for at least 1s
+        then:
+          - lambda: id(details_ms) = millis();
+          - component.update: oled
+      # Short press: read now
+      - timing:
+          - ON for at most 600ms
+          - OFF for at least 50ms
+        then:
+          - lambda: id(details_ms) = 0;
+          - script.execute: read_cycle
+          - component.update: oled
+
+text_sensor:
+  # Resting-voltage rating for a 12 V lead acid / AGM battery. Only
+  # meaningful with the engine off; "charging" while the alternator runs.
+  - platform: template
+    name: "Battery State"
+    id: battery_state
+    icon: mdi:car-battery
+    update_interval: 60s
+    lambda: |-
+      bool fresh = id(bm_last_ms) != 0 && millis() - id(bm_last_ms) < ${stale_ms};
+      if (!fresh) return {"unknown"};
+      if (id(bm_status) == 2) return {"charging"};
+      float v = id(bm_voltage);
+      if (v >= 12.6f) return {"good"};
+      if (v >= 12.4f) return {"ok"};
+      if (v >= 12.2f) return {"low"};
+      return {"critical"};
+
+switch:
+  # Off = stop polling entirely (read cycles fail fast and leave the
+  # Battery Guard alone)
+  - platform: ble_client
+    ble_client_id: bm6_client
+    name: "Battery Guard Connection"
+    icon: mdi:bluetooth-connect
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 18
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 72x40"
+    address: 0x3C
+    update_interval: 1s
+    lambda: |-
+      const int W = it.get_width();   // 72
+      const int H = it.get_height();  // 40
+      const uint32_t now = millis();
+      const bool fresh = id(bm_last_ms) != 0 && now - id(bm_last_ms) < ${stale_ms};
+
+      // ---- Details screen (long press), 5s ------------------------------
+      if (id(details_ms) != 0 && now - id(details_ms) < 5000) {
+        if (fresh) it.printf(0, -1, id(font_small), "%d°C", id(bm_temp));
+        else it.print(0, -1, id(font_small), "--°C");
+        const float brssi = id(bm6_rssi).state;
+        if (std::isnan(brssi)) it.print(W, -1, id(font_small), TextAlign::TOP_RIGHT, "BT --");
+        else it.printf(W, -1, id(font_small), TextAlign::TOP_RIGHT, "BT%.0f", brssi);
+        it.printf(0, 9, id(font_small), "rise %d", id(bm_vrise));
+        it.printf(0, 19, id(font_small), "drop %d", id(bm_vdrop));
+        const float wrssi = id(wifi_rssi).state;
+        if (std::isnan(wrssi)) it.print(0, 29, id(font_small), "WiFi --");
+        else it.printf(0, 29, id(font_small), "WiFi %.0fdB", wrssi);
+        return;
+      }
+
+      // ---- No data: show what's missing --------------------------------
+      if (!fresh) {
+        const bool wifi_ok = id(wifi_conn).is_connected();
+        const bool api_ok = id(api_server).is_connected();
+        it.print(0, -1, id(font_small), "WiFi");
+        if (wifi_ok) it.filled_circle(27, 5, 3); else it.circle(27, 5, 3);
+        it.print(43, -1, id(font_small), "HA");
+        if (api_ok) it.filled_circle(61, 5, 3); else it.circle(61, 5, 3);
+        // Connected but still in the handshake / dropped first frames
+        const char *msg = id(bm6_client).connected() ? "reading.." : "no car";
+        if ((now / 1000) % 2) it.print(W / 2, 16, id(font_small), TextAlign::TOP_CENTER, msg);
+        return;
+      }
+
+      // ---- Live reading ------------------------------------------------
+      const int soc = id(bm_soc);
+      it.printf(0, -1, id(font_small), "%d%%", soc);
+      // Age of the reading: "now" while connected, else minutes
+      if (id(bm6_client).connected()) {
+        it.print(W, -1, id(font_small), TextAlign::TOP_RIGHT, "now");
+      } else {
+        it.printf(W, -1, id(font_small), TextAlign::TOP_RIGHT, "%um", (unsigned) ((now - id(bm_last_ms)) / 60000));
+      }
+
+      // Inverted banner while charging, so "engine running" reads at a glance
+      if (id(bm_status) == 2) {
+        it.filled_rectangle(0, 11, W, 20);
+        it.printf(W / 2, 11, id(font_big), COLOR_OFF, TextAlign::TOP_CENTER, "%.2fV", id(bm_voltage));
+      } else {
+        it.printf(W / 2, 11, id(font_big), TextAlign::TOP_CENTER, "%.2fV", id(bm_voltage));
+      }
+
+      // SOC bar
+      it.rectangle(0, H - 7, W, 7);
+      const int fill = soc * (W - 2) / 100;
+      if (fill > 0) it.filled_rectangle(1, H - 6, fill, 5);

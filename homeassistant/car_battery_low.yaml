@@ -1,0 +1,29 @@
+# Paste into Settings > Automations > Create > Edit in YAML.
+# Change notify.mobile_app_YOUR_PHONE to your phone's notify service.
+#
+# Fires when the resting voltage has been below 12.2 V for 30 minutes
+# (engine off: under ~12.2 V a lead acid battery is about 50 % and starting
+# gets risky in Finnish winter). The 30 min hold ignores short dips from
+# door opening, the cabin light, etc.
+alias: Car battery low
+description: Notify when the car battery resting voltage stays low
+mode: single
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.car_battery_voltage
+    below: 12.2
+    for:
+      minutes: 30
+conditions:
+  - condition: state
+    entity_id: binary_sensor.car_battery_charging
+    state: "off"
+actions:
+  - action: notify.mobile_app_YOUR_PHONE
+    data:
+      title: "Car battery low"
+      message: >-
+        {{ states('sensor.car_battery_voltage') }} V,
+        {{ states('sensor.car_battery_state_of_charge') }} %
+        ({{ states('sensor.car_battery_temperature') }} °C).
+        Consider a drive or a charger.
